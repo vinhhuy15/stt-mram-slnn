@@ -19,8 +19,8 @@ Curves written to CSV (the MLNN column is intentionally omitted):
 3) BCH+sparse
    7 payload bits -> systematic BCH(15,7,5), t=2 -> append six zero pad bits
    -> three 7-bit blocks -> three Table-1 sparse encoders (3 x 7->9)
-   -> channel -> same Deep FFNN per sparse block -> remove padding
-   -> exhaustive nearest-BCH-codeword decoder -> 7 payload bits.
+   -> channel -> same Deep FFNN per sparse block -> joint soft decoder over
+   all 128 valid BCH messages and all three sparse-block log probabilities.
 
    IMPORTANT: this main comparison uses all 7 BCH message bits, rather than
    the earlier one-bit frozen-message experiment. This makes BER and FER
@@ -184,6 +184,12 @@ def bch_encode(messages: np.ndarray) -> np.ndarray:
 
 BCH_MESSAGES = MESSAGE_BITS.copy()
 BCH_CODEBOOK = bch_encode(BCH_MESSAGES)
+BCH_PADDED_BLOCKS = np.concatenate(
+    [BCH_CODEBOOK, np.zeros((128, 6), dtype=np.uint8)], axis=1
+).reshape(128, 3, 7)
+BCH_SPARSE_CLASS_INDICES = bits_to_indices(BCH_PADDED_BLOCKS.reshape(-1, 7)).reshape(
+    128, 3
+)
 
 
 def validate_bch() -> dict[str, int]:
@@ -582,6 +588,42 @@ def ffnn_decode_indices(
     return np.concatenate(predictions).astype(np.int64)
 
 
+@torch.inference_mode()
+def ffnn_log_probabilities(
+    model: DeepFFNN,
+    raw: np.ndarray,
+    inference_batch_size: int = 65_536,
+) -> np.ndarray:
+    """Return normalized class evidence retained for downstream soft decoding."""
+    model.eval()
+    device = next(model.parameters()).device
+    x = torch.from_numpy(normalize_ffnn(raw.reshape(-1, 9)))
+    outputs: list[np.ndarray] = []
+    for start in range(0, x.shape[0], inference_batch_size):
+        xb = x[start : start + inference_batch_size].to(device)
+        outputs.append(torch.log_softmax(model.logits(xb), dim=1).cpu().numpy())
+    return np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
+
+
+def joint_bch_sparse_decode(
+    block_log_probabilities: np.ndarray,
+) -> np.ndarray:
+    """Jointly select a BCH message using the soft evidence of all 3 blocks.
+
+    The FFNN models each sparse block posterior.  For every one of the 128
+    valid BCH messages, this decoder sums the log probabilities assigned to
+    its three expected sparse classes, then returns the maximum-score message.
+    """
+    logp = np.asarray(block_log_probabilities)
+    if logp.ndim != 3 or logp.shape[1:] != (3, 128):
+        raise ValueError("Expected block log probabilities with shape [N,3,128]")
+
+    scores = np.zeros((logp.shape[0], 128), dtype=np.float32)
+    for block in range(3):
+        scores += logp[:, block, BCH_SPARSE_CLASS_INDICES[:, block]]
+    return np.argmax(scores, axis=1).astype(np.int64)
+
+
 def sparse_ml_decode_indices(raw: np.ndarray, alpha: float, mu0: float) -> np.ndarray:
     decoder_input = raw.reshape(-1, 9) / (alpha * mu0)
     _, decoded = SPARSE_TREE.query(decoder_input, k=1, workers=-1)
@@ -828,7 +870,7 @@ def simulate_bch_sparse_ffnn(
     config: Config,
     sigma_percent: int,
 ) -> dict[str, Any]:
-    """Full-7-bit BCH+sparse+FFNN simulation (not the frozen one-bit variant)."""
+    """Full-7-bit BCH+sparse simulation with a joint soft FFNN decoder."""
     rng = stream_rng(config.seed, sigma_percent, stream_id=2)
     frames = 0
     bit_errors = 0
@@ -851,15 +893,14 @@ def simulate_bch_sparse_ffnn(
         blocks7 = bits21.reshape(n * 3, 7)
         sparse_indices = bits_to_indices(blocks7)
         raw = sample_resistance(CODEBOOK[sparse_indices], channel, rng)
-        decoded_sparse_indices = ffnn_decode_indices(model, raw)
+        block_logp = ffnn_log_probabilities(model, raw).reshape(n, 3, 128)
+        decoded_sparse_indices = block_logp.argmax(axis=2).reshape(-1)
         decoded_blocks7 = MESSAGE_BITS[decoded_sparse_indices]
 
         sparse_block_errors += int(np.sum(decoded_sparse_indices != sparse_indices))
         sparse_block_bit_errors += int(np.sum(decoded_blocks7 != blocks7))
 
-        received21 = decoded_blocks7.reshape(n, 21)
-        received15 = received21[:, :15]
-        decoded_bch_indices = nearest_bch_indices(received15)
+        decoded_bch_indices = joint_bch_sparse_decode(block_logp)
         decoded_messages = BCH_MESSAGES[decoded_bch_indices]
 
         payload_errors = decoded_messages != transmitted_messages
@@ -870,7 +911,7 @@ def simulate_bch_sparse_ffnn(
 
         if frames % 100_000 == 0 or frames == config.maximum_frames:
             print(
-                f"[eval BCH+sparse] sigma={sigma_percent}% frames={frames:,} "
+                f"[eval BCH+sparse joint] sigma={sigma_percent}% frames={frames:,} "
                 f"bit_errors={bit_errors} frame_errors={frame_errors}",
                 flush=True,
             )
@@ -884,6 +925,7 @@ def simulate_bch_sparse_ffnn(
             "BCH_codeword_errors": bch_codeword_errors,
             "sparse_block_class_error_rate": sparse_block_errors / (frames * 3),
             "sparse_block_message_BER": sparse_block_bit_errors / (frames * 3 * 7),
+            "decoder": "joint soft FFNN posterior over 128 BCH messages",
             "evaluation_seconds": time.time() - start_time,
             "stopped_by_bit_error_target": bit_errors >= config.minimum_bit_errors,
         }
@@ -1038,7 +1080,7 @@ def run(args: argparse.Namespace) -> None:
         "method_definitions": {
             "SLNN [1]": "sparse 7/9 encoder + Deep FFNN decoder; no BCH; no alpha",
             "without coding": "7 raw bits + threshold detector; exact analytical BER/FER",
-            "BCH+sparse": "full 7-bit BCH(15,7,t=2) + pad6 + 3 sparse blocks + FFNN + standard nearest-BCH decoder",
+            "BCH+sparse": "full 7-bit BCH(15,7,t=2) + pad6 + 3 sparse blocks + joint soft FFNN/BCH decoder over 128 valid messages",
             "only-BCH": "BCH(15,7,t=2) + threshold + nearest BCH; exact exhaustive hard-output enumeration",
             "only-sparse (ML decoding)": "paper baseline sparse 7/9 + alpha=2.5 Euclidean decoder",
         },
