@@ -1,0 +1,2 @@
+checkpoint_source,best_epoch,epochs_run,validation_loss,validation_accuracy,training_seconds,n_training_samples,n_validation_samples,training_sigmas,training_offset_mu,training_offset_sigma_ratio,device
+trained_now,11,16,1.513151731342e-02,9.955199956894e-01,1.964816589355e+02,1350000,150000,0.08;0.09;0.10;0.11;0.12;0.13;0.14;0.15,0.000000000000e+00,0.000000000000e+00,cpu

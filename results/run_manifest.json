@@ -1,0 +1,91 @@
+{
+  "description": "Five-curve sigma_mu sweep; MLNN omitted",
+  "created_by_script": "D:\\downloads\\sttmram_global_ffnn_training\\run_all_curves.py",
+  "script_sha256": "ba65a8243933791af20dfcafa8aa75473edd0c6864577aff6238f7ca8e399574",
+  "config": {
+    "p1": 0.0002,
+    "p0_over_p1": 0.01,
+    "pr_over_p1": 0.01,
+    "read_direction": "write0",
+    "mu0": 1.0,
+    "mu1": 2.0,
+    "offset_mean": 0.0,
+    "offset_sigma_over_mu1": 0.0,
+    "alpha": 2.5,
+    "train_sigmas": [
+      0.08,
+      0.09,
+      0.1,
+      0.11,
+      0.12,
+      0.13,
+      0.14,
+      0.15
+    ],
+    "nr_train": 1500000,
+    "training_chunk_size": 10000,
+    "train_fraction": 0.9,
+    "train_batch_size": 256,
+    "max_epochs": 30,
+    "patience": 5,
+    "min_delta": 0.0001,
+    "learning_rate": 0.01,
+    "step_size": 10,
+    "lr_gamma": 0.5,
+    "weight_decay": 0.0,
+    "evaluation_batch_frames": 5000,
+    "minimum_bit_errors": 500,
+    "maximum_frames": 5000000,
+    "seed": 42
+  },
+  "sigmas_percent": [
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "bch": {
+    "n": 15,
+    "k": 7,
+    "d_min": 5,
+    "t": 2
+  },
+  "sparse_codebook": {
+    "source": "Table 1 of Nguyen, IEEE Access 2021",
+    "shape": [
+      128,
+      9
+    ],
+    "weight_2_codewords": 36,
+    "weight_4_codewords": 92
+  },
+  "method_definitions": {
+    "SLNN [1]": "sparse 7/9 encoder + Deep FFNN decoder; no BCH; no alpha",
+    "without coding": "7 raw bits + threshold detector; exact analytical BER/FER",
+    "BCH+sparse": "full 7-bit BCH(15,7,t=2) + pad6 + 3 sparse blocks + FFNN + standard nearest-BCH decoder",
+    "only-BCH": "BCH(15,7,t=2) + threshold + nearest BCH; exact exhaustive hard-output enumeration",
+    "only-sparse (ML decoding)": "paper baseline sparse 7/9 + alpha=2.5 Euclidean decoder"
+  },
+  "payload_bits_per_frame": 7,
+  "physical_bits_per_frame": {
+    "SLNN [1]": 9,
+    "without coding": 7,
+    "BCH+sparse": 27,
+    "only-BCH": 15,
+    "only-sparse (ML decoding)": 9
+  },
+  "ffnn_training_strategy": "One global no-offset model trained on sigma=0.08..0.15 with 1.5M samples; reused for all evaluation sigmas",
+  "checkpoint_file": {
+    "path": "D:\\downloads\\sttmram_global_ffnn_training\\models\\deep_ffnn_model.pt",
+    "sha256": "9c7f3f0dd8a02d49581e94261eda95d9b313430e406532b5bb912ae1e99d5789"
+  },
+  "elapsed_seconds": 208.87555408477783,
+  "software": {
+    "python": "3.12.4 (tags/v3.12.4:8e8a4ba, Jun  6 2024, 19:30:16) [MSC v.1940 64 bit (AMD64)]",
+    "numpy": "2.5.1",
+    "pandas": "3.0.3",
+    "torch": "2.13.0+cpu"
+  }
+}
