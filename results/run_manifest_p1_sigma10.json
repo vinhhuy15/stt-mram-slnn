@@ -1,0 +1,68 @@
+{
+  "description": "Five established BER curves versus P1 at fixed sigma_mu",
+  "created_by_script": "D:\\downloads\\sttmram_global_ffnn_training\\run_all_curves.py",
+  "script_sha256": "4c6eb5b3c5cf9df1504ba4d52f3957cb2c312194271f117a9bfe5f207f469012",
+  "controlled_variable": "P1",
+  "fixed_sigma_mu_percent": 10,
+  "p1_values": [
+    2e-08,
+    2e-07,
+    2e-06,
+    2e-05,
+    0.0002,
+    0.002,
+    0.02
+  ],
+  "curve_names": [
+    "SLNN [1]",
+    "without coding",
+    "BCH+sparse",
+    "only-sparse (ML decoding)"
+  ],
+  "only_bch_skipped": true,
+  "note": "Figure 6 supplies only the sweep layout; every BER is recomputed from this repository's five existing method implementations.",
+  "common_random_numbers": "The same deterministic streams are reused across P1 points to reduce Monte Carlo comparison variance.",
+  "config_except_p1": {
+    "p1": 0.0002,
+    "p0_over_p1": 0.01,
+    "pr_over_p1": 0.01,
+    "read_direction": "write0",
+    "mu0": 1.0,
+    "mu1": 2.0,
+    "offset_mean": 0.0,
+    "offset_sigma_over_mu1": 0.0,
+    "alpha": 2.5,
+    "train_sigmas": [
+      0.08,
+      0.09,
+      0.1,
+      0.11,
+      0.12,
+      0.13,
+      0.14,
+      0.15
+    ],
+    "nr_train": 1500000,
+    "training_chunk_size": 10000,
+    "train_fraction": 0.9,
+    "train_batch_size": 256,
+    "max_epochs": 30,
+    "patience": 5,
+    "min_delta": 0.0001,
+    "learning_rate": 0.01,
+    "step_size": 10,
+    "lr_gamma": 0.5,
+    "weight_decay": 0.0,
+    "evaluation_batch_frames": 5000,
+    "minimum_bit_errors": 500,
+    "maximum_frames": 5000000,
+    "shaping_calibration_samples": 2000,
+    "seed": 42
+  },
+  "checkpoint_file": {
+    "path": "D:\\downloads\\sttmram_global_ffnn_training\\models\\deep_ffnn_model.pt",
+    "sha256": "c33e3ee639c5f6e838341c5461b41e2c1f200f8e77db89d84cb8976645216776"
+  },
+  "output_file": "D:\\downloads\\sttmram_global_ffnn_training\\results\\all_curves_p1_sigma10.csv",
+  "elapsed_seconds": 157.06864166259766
+}
