@@ -17,20 +17,16 @@ Curves written to CSV (the MLNN column is intentionally omitted):
    BER/FER are evaluated analytically, not by Monte Carlo.
 
 3) BCH+sparse
-   7 payload bits -> systematic BCH(15,7,5), t=2 -> append six zero pad bits
-   -> three 7-bit blocks -> three Table-1 sparse encoders (3 x 7->9)
+   16 payload bits -> systematic BCH(31,16,7), t=3 -> append four shaping bits
+   -> five 7-bit blocks -> five Table-1 sparse encoders (5 x 7->9)
    -> channel -> same Deep FFNN per sparse block -> remove padding
-   -> exhaustive nearest-BCH-codeword decoder -> 7 payload bits.
-
-   IMPORTANT: this main comparison uses all 7 BCH message bits, rather than
-   the earlier one-bit frozen-message experiment. This makes BER and FER
-   directly comparable with the other curves.
+   -> discard shaping bits -> syndrome bounded-distance BCH decoder -> 16 bits.
+   For each 3-bit BCH suffix, the encoder selects one of 16 padding patterns
+   whose final sparse class has the best calibrated FFNN accuracy.
 
 4) only-BCH
-   7 payload bits -> BCH(15,7,5), t=2 -> channel -> hard threshold
-   -> exhaustive nearest-BCH-codeword decoder -> 7 payload bits.
-   This branch is evaluated exactly by enumerating all 128 transmitted BCH
-   codewords and all 2^15 hard detector outputs.
+   16 payload bits -> BCH(31,16,7), t=3 -> channel -> hard threshold
+   -> syndrome bounded-distance decoder -> 16 payload bits (Monte Carlo).
 
 5) only-sparse (ML decoding)
    Original paper baseline: 7 payload bits -> Table-1 sparse encoder (7->9)
@@ -64,11 +60,13 @@ argmax(logits) and argmax(softmax(logits)) give the same class decision.
 import argparse
 import copy
 import hashlib
+import itertools
 import json
 import math
 import random
+import shutil
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +82,18 @@ from paper79.channel import (
     sample_resistance,
 )
 from paper79.codebook import CODEBOOK, MESSAGE_BITS, validate_codebook
+from paper79.distance_decoders import (
+    euclidean_decode_indices,
+    mahalanobis_decode_indices,
+    pooled_within_class_covariance,
+)
+from paper79.joint_bch_sparse import (
+    BCH15_PHYSICAL_CODEBOOK,
+    encode_bch15_sparse,
+    joint_ml_decode_indices,
+    sequential_bch15_decode_from_sparse_indices,
+    validate_joint_bch15_sparse,
+)
 
 
 # Dense CPU inference/training is faster and more reproducible with one thread.
@@ -93,8 +103,13 @@ try:
 except RuntimeError:
     pass
 
-GENERATOR = np.asarray([1, 1, 1, 0, 1, 0, 0, 0, 1], dtype=np.uint8)
+# Primitive narrow-sense binary BCH(31,16,7), t=3.  Coefficients are
+# MSB-first: x^15+x^11+x^10+x^9+x^8+x^7+x^5+x^3+x^2+x+1.
+GENERATOR = np.asarray(
+    [1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1], dtype=np.uint8
+)
 SIGMAS_PERCENT = (10, 11, 12, 13, 14, 15)
+P1_SWEEP = (2e-8, 2e-7, 2e-6, 2e-5, 2e-4, 2e-3, 2e-2)
 SPARSE_TREE = cKDTree(CODEBOOK.astype(np.float64))
 
 
@@ -132,6 +147,7 @@ class Config:
     evaluation_batch_frames: int = 5000
     minimum_bit_errors: int = 500
     maximum_frames: int = 5_000_000
+    shaping_calibration_samples: int = 2_000
 
     # Reproducibility
     seed: int = 42
@@ -163,42 +179,43 @@ def bits_to_indices(bits: np.ndarray) -> np.ndarray:
 
 
 def bch_encode(messages: np.ndarray) -> np.ndarray:
-    """Systematic BCH(15,7,5), MSB-first, g(x)=111010001."""
+    """Systematic BCH(31,16,7), MSB-first."""
     m = np.asarray(messages, dtype=np.uint8)
     one_message = False
     if m.ndim == 1:
         m = m[None, :]
         one_message = True
-    if m.ndim != 2 or m.shape[1] != 7:
-        raise ValueError("BCH messages must have shape [N,7]")
+    if m.ndim != 2 or m.shape[1] != 16:
+        raise ValueError("BCH messages must have shape [N,16]")
 
-    work = np.concatenate([m, np.zeros((m.shape[0], 8), dtype=np.uint8)], axis=1)
-    for position in range(7):
+    work = np.concatenate([m, np.zeros((m.shape[0], 15), dtype=np.uint8)], axis=1)
+    for position in range(16):
         rows = work[:, position].astype(bool)
         if np.any(rows):
-            work[rows, position : position + 9] ^= GENERATOR
-    remainder = work[:, 7:15]
+            work[rows, position : position + 16] ^= GENERATOR
+    remainder = work[:, 16:31]
     codeword = np.concatenate([m, remainder], axis=1)
     return codeword[0] if one_message else codeword
 
 
-BCH_MESSAGES = MESSAGE_BITS.copy()
-BCH_CODEBOOK = bch_encode(BCH_MESSAGES)
+BCH_MESSAGE_VALUES = np.arange(1 << 16, dtype=np.uint32)
+BCH_MESSAGES = (
+    (BCH_MESSAGE_VALUES[:, None] >> np.arange(15, -1, -1, dtype=np.uint32)) & 1
+).astype(np.uint8)
 
 
 def validate_bch() -> dict[str, int]:
-    if BCH_CODEBOOK.shape != (128, 15):
-        raise AssertionError("BCH codebook shape is not 128x15")
-    if not np.array_equal(BCH_CODEBOOK[:, :7], BCH_MESSAGES):
+    codebook = bch_encode(BCH_MESSAGES)
+    if codebook.shape != (65536, 31):
+        raise AssertionError("BCH codebook shape is not 65536x31")
+    if not np.array_equal(codebook[:, :16], BCH_MESSAGES):
         raise AssertionError("BCH encoder is not systematic")
-
-    d_min = 15
-    for i in range(127):
-        distances = np.sum(BCH_CODEBOOK[i + 1 :] != BCH_CODEBOOK[i], axis=1)
-        d_min = min(d_min, int(distances.min()))
-    if d_min != 5:
-        raise AssertionError(f"Expected BCH d_min=5, obtained {d_min}")
-    return {"n": 15, "k": 7, "d_min": 5, "t": 2}
+    # The code is linear, so its minimum distance is the minimum nonzero
+    # codeword weight; no O(M^2) pairwise comparison is needed.
+    d_min = int(np.sum(codebook[1:], axis=1).min())
+    if d_min != 7:
+        raise AssertionError(f"Expected BCH d_min=7, obtained {d_min}")
+    return {"n": 31, "k": 16, "d_min": 7, "t": 3, "padding_bits": 4}
 
 
 class DeepFFNN(nn.Module):
@@ -347,6 +364,8 @@ def create_mixed_training_dataset(
 def train_global_ffnn(
     config: Config,
     model_path: Path,
+    initial_state: dict[str, torch.Tensor] | None = None,
+    checkpoint_source: str = "trained_now",
 ) -> tuple[DeepFFNN, list[dict[str, Any]], dict[str, Any]]:
     """Train one global network and reuse it at every evaluation sigma."""
     set_global_seed(config.seed)
@@ -354,6 +373,8 @@ def train_global_ffnn(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DeepFFNN().to(device)
+    if initial_state is not None:
+        model.load_state_dict(initial_state)
     if trainable_parameter_count(model) != 16_288:
         raise AssertionError("Deep FFNN parameter count must be 16,288")
 
@@ -495,7 +516,7 @@ def train_global_ffnn(
     torch.save(checkpoint, model_path)
 
     summary = {
-        "checkpoint_source": "trained_now",
+        "checkpoint_source": checkpoint_source,
         "best_epoch": best_epoch,
         "epochs_run": len(history),
         "validation_loss": restored_loss,
@@ -515,7 +536,30 @@ def load_or_train_global_ffnn(
     config: Config,
     model_path: Path,
     retrain: bool,
+    finetune: bool,
 ) -> tuple[DeepFFNN, list[dict[str, Any]], dict[str, Any]]:
+    if retrain and finetune:
+        raise ValueError("--retrain and --finetune cannot be used together")
+
+    if finetune:
+        if not model_path.exists():
+            raise FileNotFoundError("--finetune requires an existing FFNN checkpoint")
+        try:
+            checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(model_path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise ValueError("Existing checkpoint has no state_dict to fine-tune")
+        backup_path = model_path.with_name(model_path.stem + "_pre_finetune.pt")
+        shutil.copy2(model_path, backup_path)
+        print(f"[fine-tune] backed up original checkpoint to {backup_path}", flush=True)
+        return train_global_ffnn(
+            config,
+            model_path,
+            initial_state=checkpoint["state_dict"],
+            checkpoint_source="fine_tuned_existing",
+        )
+
     if model_path.exists() and not retrain:
         try:
             checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -528,13 +572,6 @@ def load_or_train_global_ffnn(
                 "Existing checkpoint is not the global mixed-sigma model. "
                 "Run with --retrain or use a clean model directory."
             )
-        if tuple(float(x) for x in checkpoint.get("training_sigmas", [])) != tuple(
-            config.train_sigmas
-        ):
-            raise ValueError("Checkpoint training-sigma list does not match Config")
-        if int(checkpoint.get("nr_train", -1)) != config.nr_train:
-            raise ValueError("Checkpoint nr_train does not match Config")
-
         model = DeepFFNN()
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
@@ -550,10 +587,15 @@ def load_or_train_global_ffnn(
                 "restored_validation_accuracy", np.nan
             ),
             "training_seconds": 0.0,
-            "n_training_samples": int(config.nr_train * config.train_fraction),
-            "n_validation_samples": config.nr_train
-            - int(config.nr_train * config.train_fraction),
-            "training_sigmas": ";".join(f"{s:.2f}" for s in config.train_sigmas),
+            "n_training_samples": int(
+                checkpoint.get("nr_train", config.nr_train) * config.train_fraction
+            ),
+            "n_validation_samples": int(
+                checkpoint.get("nr_train", config.nr_train) * (1.0 - config.train_fraction)
+            ),
+            "training_sigmas": ";".join(
+                f"{float(s):.2f}" for s in checkpoint.get("training_sigmas", [])
+            ),
             "training_offset_mu": checkpoint.get("training_offset_mu", 0.0),
             "training_offset_sigma_ratio": checkpoint.get(
                 "training_offset_sigma_ratio", 0.0
@@ -582,51 +624,87 @@ def ffnn_decode_indices(
     return np.concatenate(predictions).astype(np.int64)
 
 
+def calibrate_shaping_padding(
+    model: DeepFFNN,
+    channel: ChannelConfig,
+    rng: np.random.Generator,
+    samples_per_class: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Choose the most reliable last-block class for each 3-bit BCH suffix.
+
+    The high three bits of each candidate are fixed by BCH.  Its low four
+    bits are free shaping bits, giving 16 candidate sparse codewords.
+    """
+    class_indices = np.repeat(np.arange(128, dtype=np.int64), samples_per_class)
+    raw = sample_resistance(CODEBOOK[class_indices], channel, rng)
+    decoded = ffnn_decode_indices(model, raw)
+    accuracy = np.bincount(
+        class_indices, weights=(decoded == class_indices), minlength=128
+    ) / samples_per_class
+
+    chosen_indices = np.empty(8, dtype=np.int64)
+    for prefix in range(8):
+        start = prefix << 4
+        # np.argmax gives a deterministic lowest-padding tie break.
+        chosen_indices[prefix] = start + int(np.argmax(accuracy[start : start + 16]))
+    padding = MESSAGE_BITS[chosen_indices, 3:].copy()
+    return padding, accuracy
+
+
 def sparse_ml_decode_indices(raw: np.ndarray, alpha: float, mu0: float) -> np.ndarray:
     decoder_input = raw.reshape(-1, 9) / (alpha * mu0)
     _, decoded = SPARSE_TREE.query(decoder_input, k=1, workers=-1)
     return np.asarray(decoded, dtype=np.int64)
 
 
-def build_all_hard_vectors() -> np.ndarray:
-    values = np.arange(1 << 15, dtype=np.uint16)
-    shifts = np.arange(14, -1, -1, dtype=np.uint16)
-    return ((values[:, None] >> shifts[None, :]) & 1).astype(np.uint8)
+SYNDROME_WEIGHTS = (1 << np.arange(14, -1, -1, dtype=np.uint32))
+BCH_BIT_WEIGHTS = (1 << np.arange(30, -1, -1, dtype=np.uint32))
 
 
-ALL_HARD_15 = build_all_hard_vectors()
+def bch_syndromes(vectors: np.ndarray) -> np.ndarray:
+    """Return polynomial remainders (15-bit syndromes) for 31-bit vectors."""
+    work = np.asarray(vectors, dtype=np.uint8).copy()
+    if work.ndim != 2 or work.shape[1] != 31:
+        raise ValueError("Expected BCH vectors with shape [N,31]")
+    for position in range(16):
+        rows = work[:, position].astype(bool)
+        if np.any(rows):
+            work[rows, position : position + 16] ^= GENERATOR
+    return (work[:, 16:].astype(np.uint32) @ SYNDROME_WEIGHTS).astype(np.uint16)
 
 
-def build_bch_nearest_lookup(chunk_size: int = 1024) -> np.ndarray:
-    """Map every possible hard 15-bit vector to nearest BCH codeword index.
-
-    np.argmin provides a deterministic lowest-index tie break.
-    """
-    output = np.empty(1 << 15, dtype=np.uint8)
-    for start in range(0, 1 << 15, chunk_size):
-        received = ALL_HARD_15[start : start + chunk_size]
-        distances = np.sum(
-            received[:, None, :] != BCH_CODEBOOK[None, :, :],
-            axis=2,
-            dtype=np.int16,
-        )
-        output[start : start + received.shape[0]] = np.argmin(distances, axis=1).astype(np.uint8)
-    return output
-
-
-BCH_NEAREST_LOOKUP = build_bch_nearest_lookup()
-BINARY_15_WEIGHTS = (1 << np.arange(14, -1, -1, dtype=np.int64))
+def build_bch_error_lookup() -> tuple[np.ndarray, np.ndarray]:
+    """Coset leaders for every error pattern of weight <= 3."""
+    masks = np.zeros(1 << 15, dtype=np.uint32)
+    valid = np.zeros(1 << 15, dtype=bool)
+    valid[0] = True
+    for weight in (1, 2, 3):
+        combinations = list(itertools.combinations(range(31), weight))
+        errors = np.zeros((len(combinations), 31), dtype=np.uint8)
+        for row, positions in enumerate(combinations):
+            errors[row, list(positions)] = 1
+        syndromes = bch_syndromes(errors)
+        integer_masks = errors.astype(np.uint32) @ BCH_BIT_WEIGHTS
+        if np.any(valid[syndromes]):
+            raise AssertionError("BCH syndromes collide for error weight <= 3")
+        masks[syndromes] = integer_masks
+        valid[syndromes] = True
+    return masks, valid
 
 
-def hard_vectors_to_integer(received: np.ndarray) -> np.ndarray:
+BCH_ERROR_MASKS, BCH_CORRECTABLE_SYNDROMES = build_bch_error_lookup()
+
+
+def bch_decode(received: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Bounded-distance decode; uncorrectable words are returned unchanged."""
     arr = np.asarray(received, dtype=np.uint8)
-    if arr.ndim != 2 or arr.shape[1] != 15:
-        raise ValueError("Expected received hard BCH vectors with shape [N,15]")
-    return (arr.astype(np.int64) @ BINARY_15_WEIGHTS).astype(np.int64)
-
-
-def nearest_bch_indices(received: np.ndarray) -> np.ndarray:
-    return BCH_NEAREST_LOOKUP[hard_vectors_to_integer(received)].astype(np.int64)
+    syndromes = bch_syndromes(arr)
+    values = arr.astype(np.uint32) @ BCH_BIT_WEIGHTS
+    corrected_values = values ^ BCH_ERROR_MASKS[syndromes]
+    corrected = (
+        (corrected_values[:, None] >> np.arange(30, -1, -1, dtype=np.uint32)) & 1
+    ).astype(np.uint8)
+    return corrected[:, :16], BCH_CORRECTABLE_SYNDROMES[syndromes]
 
 
 def wilson_interval(errors: int, trials: int, z: float = 1.96) -> tuple[float, float]:
@@ -695,65 +773,39 @@ def exact_without_coding(channel: ChannelConfig) -> dict[str, Any]:
     }
 
 
-def exact_only_bch(channel: ChannelConfig) -> dict[str, Any]:
-    """Exact only-BCH BER/FER by exhaustive hard-output enumeration."""
+def simulate_only_bch(
+    channel: ChannelConfig, config: Config, sigma_percent: int
+) -> dict[str, Any]:
+    """Monte Carlo BCH(31,16,7) with hard detection and t=3 decoding."""
     e0, e1 = conditional_detector_error_probabilities(channel)
-    decoded_messages = BCH_MESSAGES[BCH_NEAREST_LOOKUP]
-
-    ber_sum = 0.0
-    fer_sum = 0.0
-    probability_mass_error_max = 0.0
-
-    # Average uniformly over all 128 possible 7-bit messages.
-    for tx_index in range(128):
-        transmitted = BCH_CODEBOOK[tx_index]
-        # Matrix [32768,15]: Pr(received hard bit | transmitted hard bit)
-        probabilities_by_bit = np.empty_like(ALL_HARD_15, dtype=np.float64)
-
-        tx0 = transmitted == 0
-        tx1 = ~tx0
-        probabilities_by_bit[:, tx0] = np.where(
-            ALL_HARD_15[:, tx0] == 0,
-            1.0 - e0,
-            e0,
-        )
-        probabilities_by_bit[:, tx1] = np.where(
-            ALL_HARD_15[:, tx1] == 1,
-            1.0 - e1,
-            e1,
-        )
-        probabilities = np.prod(probabilities_by_bit, axis=1)
-        probability_mass_error_max = max(
-            probability_mass_error_max,
-            abs(float(probabilities.sum()) - 1.0),
-        )
-
-        payload_errors = decoded_messages != BCH_MESSAGES[tx_index]
-        hamming = np.sum(payload_errors, axis=1)
-        # Elementwise sum is intentionally used instead of np.dot here.
-        # On some BLAS builds, dot(float, bool) is unexpectedly very slow.
-        ber_sum += float(np.sum(probabilities * (hamming / 7.0)))
-        fer_sum += float(np.sum(probabilities * (hamming > 0)))
-
-    ber = ber_sum / 128.0
-    fer = fer_sum / 128.0
-    return {
-        "method": "only-BCH",
-        "BER": ber,
-        "FER": fer,
-        "bit_errors": np.nan,
-        "frame_errors": np.nan,
-        "frames": 128 * (1 << 15),
-        "payload_bit_trials": np.nan,
-        "BER_ci95_low": ber,
-        "BER_ci95_high": ber,
-        "FER_ci95_low": fer,
-        "FER_ci95_high": fer,
-        "evaluation": "exact exhaustive enumeration",
-        "probability_mass_error_max": probability_mass_error_max,
+    rng = stream_rng(config.seed, sigma_percent, stream_id=3)
+    frames = bit_errors = frame_errors = decoder_failures = 0
+    start_time = time.time()
+    while frames < config.maximum_frames:
+        n = min(config.evaluation_batch_frames, config.maximum_frames - frames)
+        messages = rng.integers(0, 2, size=(n, 16), dtype=np.uint8)
+        transmitted = bch_encode(messages)
+        flip_probability = np.where(transmitted == 0, e0, e1)
+        received = transmitted ^ (rng.random(transmitted.shape) < flip_probability)
+        decoded, correctable = bch_decode(received)
+        errors = decoded != messages
+        bit_errors += int(errors.sum())
+        frame_errors += int(np.any(errors, axis=1).sum())
+        decoder_failures += int((~correctable).sum())
+        frames += n
+        if bit_errors >= config.minimum_bit_errors:
+            break
+    result = metrics_record(
+        "only-BCH", bit_errors, frame_errors, frames, payload_bits_per_frame=16
+    )
+    result.update({
+        "evaluation_seconds": time.time() - start_time,
+        "stopped_by_bit_error_target": bit_errors >= config.minimum_bit_errors,
+        "decoder_failure_rate": decoder_failures / frames,
         "detector_error_given_0": e0,
         "detector_error_given_1": e1,
-    }
+    })
+    return result
 
 
 def simulate_slnn_and_only_sparse_ml(
@@ -822,13 +874,76 @@ def simulate_slnn_and_only_sparse_ml(
     return ffnn_result, ml_result
 
 
+def simulate_classical_distance_decoders(
+    channel: ChannelConfig,
+    config: Config,
+    sigma_percent: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Paired comparison of Euclidean and Mahalanobis, with no AI model."""
+    rng = stream_rng(config.seed, sigma_percent, stream_id=4)
+    counters = {
+        "Euclidean": {"bits": 0, "frames": 0},
+        "Mahalanobis": {"bits": 0, "frames": 0},
+    }
+    frames = 0
+    start_time = time.time()
+    while frames < config.maximum_frames:
+        n = min(config.evaluation_batch_frames, config.maximum_frames - frames)
+        source_indices = rng.integers(0, 128, size=n, dtype=np.int64)
+        transmitted_messages = MESSAGE_BITS[source_indices]
+        raw = sample_resistance(CODEBOOK[source_indices], channel, rng)
+
+        decoded = {
+            "Euclidean": euclidean_decode_indices(raw, channel),
+            "Mahalanobis": mahalanobis_decode_indices(raw, channel),
+        }
+        for name, decoded_indices in decoded.items():
+            errors = MESSAGE_BITS[decoded_indices] != transmitted_messages
+            counters[name]["bits"] += int(errors.sum())
+            counters[name]["frames"] += int(np.any(errors, axis=1).sum())
+        frames += n
+
+        if frames % 100_000 == 0 or frames == config.maximum_frames:
+            print(
+                f"[classical distance] sigma={sigma_percent}% frames={frames:,} "
+                f"Euclidean_errors={counters['Euclidean']['bits']} "
+                f"Mahalanobis_errors={counters['Mahalanobis']['bits']}",
+                flush=True,
+            )
+        if all(
+            values["bits"] >= config.minimum_bit_errors
+            for values in counters.values()
+        ):
+            break
+
+    elapsed = time.time() - start_time
+    results = []
+    for name in ("Euclidean", "Mahalanobis"):
+        result = metrics_record(
+            name,
+            counters[name]["bits"],
+            counters[name]["frames"],
+            frames,
+        )
+        result.update(
+            {
+                "evaluation_seconds": elapsed,
+                "stopped_by_bit_error_target": (
+                    counters[name]["bits"] >= config.minimum_bit_errors
+                ),
+            }
+        )
+        results.append(result)
+    return results[0], results[1]
+
+
 def simulate_bch_sparse_ffnn(
     model: nn.Module,
     channel: ChannelConfig,
     config: Config,
     sigma_percent: int,
 ) -> dict[str, Any]:
-    """Full-7-bit BCH+sparse+FFNN simulation (not the frozen one-bit variant)."""
+    """BCH(31,16,7) + four zero pad bits + five sparse/FFNN blocks."""
     rng = stream_rng(config.seed, sigma_percent, stream_id=2)
     frames = 0
     bit_errors = 0
@@ -837,18 +952,32 @@ def simulate_bch_sparse_ffnn(
     sparse_block_errors = 0
     sparse_block_bit_errors = 0
     start_time = time.time()
+    shaping_rng = stream_rng(config.seed, sigma_percent, stream_id=22)
+    shaping_padding, shaping_class_accuracy = calibrate_shaping_padding(
+        model,
+        channel,
+        shaping_rng,
+        config.shaping_calibration_samples,
+    )
+    shaping_indices = (
+        np.arange(8, dtype=np.int64) * 16
+        + (shaping_padding.astype(np.int64) @ np.asarray([8, 4, 2, 1]))
+    )
+    fixed_zero_indices = np.arange(8, dtype=np.int64) * 16
 
     while frames < config.maximum_frames:
         n = min(config.evaluation_batch_frames, config.maximum_frames - frames)
-        source_indices = rng.integers(0, 128, size=n, dtype=np.int64)
-        transmitted_messages = BCH_MESSAGES[source_indices]
-        transmitted_bch = BCH_CODEBOOK[source_indices]
+        transmitted_messages = rng.integers(0, 2, size=(n, 16), dtype=np.uint8)
+        transmitted_bch = bch_encode(transmitted_messages)
 
-        bits21 = np.concatenate(
-            [transmitted_bch, np.zeros((n, 6), dtype=np.uint8)],
-            axis=1,
+        suffix_values = bits_to_indices(
+            np.concatenate(
+                [np.zeros((n, 4), dtype=np.uint8), transmitted_bch[:, 28:31]], axis=1
+            )
         )
-        blocks7 = bits21.reshape(n * 3, 7)
+        selected_padding = shaping_padding[suffix_values]
+        bits35 = np.concatenate([transmitted_bch, selected_padding], axis=1)
+        blocks7 = bits35.reshape(n * 5, 7)
         sparse_indices = bits_to_indices(blocks7)
         raw = sample_resistance(CODEBOOK[sparse_indices], channel, rng)
         decoded_sparse_indices = ffnn_decode_indices(model, raw)
@@ -857,15 +986,13 @@ def simulate_bch_sparse_ffnn(
         sparse_block_errors += int(np.sum(decoded_sparse_indices != sparse_indices))
         sparse_block_bit_errors += int(np.sum(decoded_blocks7 != blocks7))
 
-        received21 = decoded_blocks7.reshape(n, 21)
-        received15 = received21[:, :15]
-        decoded_bch_indices = nearest_bch_indices(received15)
-        decoded_messages = BCH_MESSAGES[decoded_bch_indices]
+        received35 = decoded_blocks7.reshape(n, 35)
+        decoded_messages, correctable = bch_decode(received35[:, :31])
 
         payload_errors = decoded_messages != transmitted_messages
         bit_errors += int(payload_errors.sum())
         frame_errors += int(np.any(payload_errors, axis=1).sum())
-        bch_codeword_errors += int(np.sum(decoded_bch_indices != source_indices))
+        bch_codeword_errors += int(np.any(payload_errors, axis=1).sum())
         frames += n
 
         if frames % 100_000 == 0 or frames == config.maximum_frames:
@@ -877,18 +1004,139 @@ def simulate_bch_sparse_ffnn(
         if bit_errors >= config.minimum_bit_errors:
             break
 
-    result = metrics_record("BCH+sparse", bit_errors, frame_errors, frames)
+    result = metrics_record(
+        "BCH+sparse", bit_errors, frame_errors, frames, payload_bits_per_frame=16
+    )
     result.update(
         {
             "BCH_codeword_error_rate": bch_codeword_errors / frames,
             "BCH_codeword_errors": bch_codeword_errors,
-            "sparse_block_class_error_rate": sparse_block_errors / (frames * 3),
-            "sparse_block_message_BER": sparse_block_bit_errors / (frames * 3 * 7),
+            "sparse_block_class_error_rate": sparse_block_errors / (frames * 5),
+            "sparse_block_message_BER": sparse_block_bit_errors / (frames * 5 * 7),
+            "shaping_padding_by_3bit_suffix": ";".join(
+                "".join(map(str, row.tolist())) for row in shaping_padding
+            ),
+            "shaping_selected_accuracy_mean": float(
+                shaping_class_accuracy[shaping_indices].mean()
+            ),
+            "shaping_fixed_zero_accuracy_mean": float(
+                shaping_class_accuracy[fixed_zero_indices].mean()
+            ),
             "evaluation_seconds": time.time() - start_time,
             "stopped_by_bit_error_target": bit_errors >= config.minimum_bit_errors,
         }
     )
     return result
+
+
+def simulate_bch15_sparse_decoders(
+    model: nn.Module,
+    channel: ChannelConfig,
+    config: Config,
+    sigma_percent: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Compare cascaded FFNN+BCH against exact 27-resistance joint ML.
+
+    Both decoders see exactly the same BCH(15,7) messages and channel samples:
+    15 BCH bits + six fixed zeros -> three sparse 7/9 blocks -> 27 cells.
+    """
+    rng = stream_rng(config.seed, sigma_percent, stream_id=15)
+    frames = 0
+    sequential_bit_errors = 0
+    sequential_frame_errors = 0
+    sequential_decoder_failures = 0
+    joint_bit_errors = 0
+    joint_frame_errors = 0
+    sequential_seconds = 0.0
+    joint_seconds = 0.0
+    started = time.time()
+
+    while frames < config.maximum_frames:
+        n = min(config.evaluation_batch_frames, config.maximum_frames - frames)
+        message_indices = rng.integers(0, 128, size=n, dtype=np.int64)
+        transmitted_messages = MESSAGE_BITS[message_indices]
+        _, physical_bits = encode_bch15_sparse(transmitted_messages)
+        raw27 = sample_resistance(physical_bits, channel, rng)
+
+        decoder_started = time.perf_counter()
+        hard_sparse_indices = ffnn_decode_indices(
+            model, raw27.reshape(n * 3, 9)
+        ).reshape(n, 3)
+        sequential_messages, correctable = sequential_bch15_decode_from_sparse_indices(
+            hard_sparse_indices
+        )
+        sequential_seconds += time.perf_counter() - decoder_started
+
+        decoder_started = time.perf_counter()
+        joint_indices = joint_ml_decode_indices(raw27, channel)
+        joint_messages = MESSAGE_BITS[joint_indices]
+        joint_seconds += time.perf_counter() - decoder_started
+
+        sequential_errors = sequential_messages != transmitted_messages
+        joint_errors = joint_messages != transmitted_messages
+        sequential_bit_errors += int(sequential_errors.sum())
+        sequential_frame_errors += int(np.any(sequential_errors, axis=1).sum())
+        sequential_decoder_failures += int((~correctable).sum())
+        joint_bit_errors += int(joint_errors.sum())
+        joint_frame_errors += int(np.any(joint_errors, axis=1).sum())
+        frames += n
+
+        if frames % 100_000 == 0 or frames == config.maximum_frames:
+            print(
+                f"[eval BCH15+sparse] sigma={sigma_percent}% frames={frames:,} "
+                f"sequential_errors={sequential_bit_errors} "
+                f"joint_errors={joint_bit_errors}",
+                flush=True,
+            )
+        if (
+            sequential_bit_errors >= config.minimum_bit_errors
+            and joint_bit_errors >= config.minimum_bit_errors
+        ):
+            break
+
+    sequential = metrics_record(
+        "BCH(15,7)+sparse sequential FFNN",
+        sequential_bit_errors,
+        sequential_frame_errors,
+        frames,
+        payload_bits_per_frame=7,
+    )
+    joint = metrics_record(
+        "BCH(15,7)+sparse joint ML",
+        joint_bit_errors,
+        joint_frame_errors,
+        frames,
+        payload_bits_per_frame=7,
+    )
+    common = {
+        "physical_bits_per_frame": 27,
+        "BCH_n": 15,
+        "BCH_k": 7,
+        "BCH_t": 2,
+        "padding_bits": 6,
+        "sparse_blocks": 3,
+        "same_received_samples": True,
+        "evaluation_seconds_total": time.time() - started,
+    }
+    sequential.update(
+        {
+            **common,
+            "decoder_seconds": sequential_seconds,
+            "decoder_failure_rate": sequential_decoder_failures / frames,
+            "stopped_by_bit_error_target": (
+                sequential_bit_errors >= config.minimum_bit_errors
+            ),
+        }
+    )
+    joint.update(
+        {
+            **common,
+            "decoder_seconds": joint_seconds,
+            "joint_candidates": int(BCH15_PHYSICAL_CODEBOOK.shape[0]),
+            "stopped_by_bit_error_target": joint_bit_errors >= config.minimum_bit_errors,
+        }
+    )
+    return sequential, joint
 
 
 def channel_for_sigma(config: Config, sigma_percent: int) -> ChannelConfig:
@@ -913,24 +1161,268 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def evaluate_five_methods(
+    model: nn.Module,
+    config: Config,
+    sigma_percent: int,
+    include_only_bch: bool = True,
+) -> list[dict[str, Any]]:
+    """Evaluate the established curves for one controlled channel point."""
+    channel = channel_for_sigma(config, sigma_percent)
+    without_coding = exact_without_coding(channel)
+    slnn, only_sparse_ml = simulate_slnn_and_only_sparse_ml(
+        model, channel, config, sigma_percent
+    )
+    bch_sparse = simulate_bch_sparse_ffnn(model, channel, config, sigma_percent)
+    results = [slnn, without_coding, bch_sparse]
+    if include_only_bch:
+        results.append(simulate_only_bch(channel, config, sigma_percent))
+    results.append(only_sparse_ml)
+    return results
+
+
+def result_by_method(
+    method_results: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {str(result["method"]): result for result in method_results}
+
+
+def run_p1_sweep(
+    args: argparse.Namespace,
+    model: nn.Module,
+    base_config: Config,
+    output_dir: Path,
+    model_path: Path,
+) -> None:
+    """Write the BER-vs-P1 table at fixed sigma_mu=10%."""
+    sigma_percent = args.p1_sigma
+    rows: list[dict[str, Any]] = []
+    started = time.time()
+    output_path = output_dir / f"all_curves_p1_sigma{sigma_percent}.csv"
+
+    for p1 in args.p1_values:
+        point_config = replace(base_config, p1=float(p1))
+        method_results = evaluate_five_methods(
+            model,
+            point_config,
+            sigma_percent,
+            include_only_bch=not args.skip_only_bch,
+        )
+        by_method = result_by_method(method_results)
+        row = {
+            "sigma_mu": sigma_percent,
+            "P1": float(p1),
+            "SLNN [1] BER": by_method["SLNN [1]"]["BER"],
+            "SLNN [1] FER": by_method["SLNN [1]"]["FER"],
+            "without coding BER": by_method["without coding"]["BER"],
+            "without coding FER": by_method["without coding"]["FER"],
+            "BCH+sparse BER": by_method["BCH+sparse"]["BER"],
+            "BCH+sparse FER": by_method["BCH+sparse"]["FER"],
+            "only-sparse (ML decoding) BER": by_method[
+                "only-sparse (ML decoding)"
+            ]["BER"],
+            "only-sparse (ML decoding) FER": by_method[
+                "only-sparse (ML decoding)"
+            ]["FER"],
+        }
+        if not args.skip_only_bch:
+            row["only-BCH BER"] = by_method["only-BCH"]["BER"]
+            row["only-BCH FER"] = by_method["only-BCH"]["FER"]
+        rows.append(row)
+        pd.DataFrame(rows).to_csv(output_path, index=False, float_format="%.12e")
+        print("\nCurrent P1-sweep BER table:")
+        print(pd.DataFrame(rows).to_string(index=False), flush=True)
+
+    script_path = Path(__file__).resolve()
+    manifest = {
+        "description": "Five established BER curves versus P1 at fixed sigma_mu",
+        "created_by_script": str(script_path),
+        "script_sha256": file_sha256(script_path),
+        "controlled_variable": "P1",
+        "fixed_sigma_mu_percent": sigma_percent,
+        "p1_values": [float(value) for value in args.p1_values],
+        "curve_names": [str(result["method"]) for result in method_results],
+        "only_bch_skipped": bool(args.skip_only_bch),
+        "note": (
+            "Figure 6 supplies only the sweep layout; every BER is recomputed "
+            "from this repository's five existing method implementations."
+        ),
+        "common_random_numbers": (
+            "The same deterministic streams are reused across P1 points to reduce "
+            "Monte Carlo comparison variance."
+        ),
+        "config_except_p1": asdict(base_config),
+        "checkpoint_file": {
+            "path": str(model_path),
+            "sha256": file_sha256(model_path),
+        },
+        "output_file": str(output_path),
+        "elapsed_seconds": time.time() - started,
+    }
+    with (output_dir / f"run_manifest_p1_sigma{sigma_percent}.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(manifest, file, indent=2)
+
+
+def run_joint_bch15_experiment(
+    args: argparse.Namespace,
+    model: nn.Module,
+    config: Config,
+    output_dir: Path,
+    model_path: Path,
+) -> None:
+    """Run the controlled cascaded-versus-joint BCH(15,7)+sparse experiment."""
+    rows: list[dict[str, Any]] = []
+    started = time.time()
+    output_path = output_dir / "joint_bch15_sparse27.csv"
+    bch_description = validate_joint_bch15_sparse()
+
+    for sigma_percent in args.sigmas:
+        channel = channel_for_sigma(config, sigma_percent)
+        sequential, joint = simulate_bch15_sparse_decoders(
+            model, channel, config, sigma_percent
+        )
+        for result in (sequential, joint):
+            rows.append(
+                {
+                    "P1": config.p1,
+                    "sigma_mu_percent": sigma_percent,
+                    **result,
+                }
+            )
+        pd.DataFrame(rows).to_csv(output_path, index=False, float_format="%.12e")
+        print("\nCurrent BCH(15,7)+sparse joint-decoder table:")
+        print(
+            pd.DataFrame(rows)[
+                ["sigma_mu_percent", "method", "BER", "FER", "frames"]
+            ].to_string(index=False),
+            flush=True,
+        )
+
+    script_path = Path(__file__).resolve()
+    manifest = {
+        "description": (
+            "Controlled BCH(15,7)+6 zero padding+3 sparse blocks experiment: "
+            "cascaded FFNN/hard/BCH versus exact joint ML over 27 resistances"
+        ),
+        "created_by_script": str(script_path),
+        "script_sha256": file_sha256(script_path),
+        "config": asdict(config),
+        "sigmas_percent": list(args.sigmas),
+        "bch_sparse": bch_description,
+        "hypothesis": "Joint 27-cell ML reduces payload BER/FER.",
+        "controlled_comparison": (
+            "Both decoders consume identical transmitted messages and resistance samples."
+        ),
+        "baseline": "global FFNN per 9-cell block -> hard 21 bits -> BCH(15,7)",
+        "proposed": "argmax over 128 exact channel likelihoods using all 27 cells",
+        "checkpoint_file": {
+            "path": str(model_path),
+            "sha256": file_sha256(model_path),
+        },
+        "output_file": str(output_path),
+        "elapsed_seconds": time.time() - started,
+    }
+    with (output_dir / "run_manifest_joint_bch15_sparse27.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(manifest, file, indent=2)
+
+
+def run_classical_distance_experiment(
+    args: argparse.Namespace,
+    config: Config,
+    output_dir: Path,
+) -> None:
+    """Compare two non-learning sparse decoders on paired channel samples."""
+    rows: list[dict[str, Any]] = []
+    started = time.time()
+    output_path = output_dir / "classical_distance_comparison.csv"
+    covariance_diagonals: dict[str, list[float]] = {}
+
+    for sigma_percent in args.sigmas:
+        channel = channel_for_sigma(config, sigma_percent)
+        euclidean, mahalanobis = simulate_classical_distance_decoders(
+            channel, config, sigma_percent
+        )
+        covariance_diagonals[str(sigma_percent)] = np.diag(
+            pooled_within_class_covariance(channel)
+        ).tolist()
+        for result in (euclidean, mahalanobis):
+            rows.append(
+                {
+                    "P1": config.p1,
+                    "sigma_mu_percent": sigma_percent,
+                    **result,
+                }
+            )
+        pd.DataFrame(rows).to_csv(output_path, index=False, float_format="%.12e")
+        print("\nCurrent non-AI distance comparison:")
+        print(
+            pd.DataFrame(rows)[
+                ["sigma_mu_percent", "method", "BER", "FER", "frames"]
+            ].to_string(index=False),
+            flush=True,
+        )
+
+    script_path = Path(__file__).resolve()
+    manifest = {
+        "description": "Paired non-AI Euclidean versus Mahalanobis sparse decoding",
+        "created_by_script": str(script_path),
+        "script_sha256": file_sha256(script_path),
+        "hypothesis": "Channel-aware pooled Mahalanobis distance reduces BER/FER.",
+        "controlled_comparison": (
+            "Both decoders use the same analytical channel centroids, transmitted "
+            "messages, resistance samples, stopping rules, and seed."
+        ),
+        "euclidean": "argmin_c (r-c)^T(r-c)",
+        "mahalanobis": "argmin_c (r-c)^T Sigma^-1 (r-c)",
+        "covariance": (
+            "Analytical pooled within-class covariance. It is diagonal because "
+            "the implemented channel samples cells conditionally independently."
+        ),
+        "covariance_diagonal_by_sigma": covariance_diagonals,
+        "config": asdict(config),
+        "sigmas_percent": list(args.sigmas),
+        "output_file": str(output_path),
+        "elapsed_seconds": time.time() - started,
+        "uses_ai": False,
+    }
+    with (output_dir / "run_manifest_classical_distance.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(manifest, file, indent=2)
+
+
 def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).resolve()
     model_dir = Path(args.model_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    training_sigmas = (
+        tuple(args.finetune_train_sigmas) if args.finetune else tuple(args.train_sigmas)
+    )
     config = Config(
-        train_sigmas=tuple(args.train_sigmas),
-        nr_train=args.nr_train,
+        train_sigmas=training_sigmas,
+        nr_train=args.finetune_nr_train if args.finetune else args.nr_train,
         training_chunk_size=args.training_chunk_size,
         train_batch_size=args.train_batch_size,
-        max_epochs=args.max_epochs,
+        max_epochs=args.finetune_epochs if args.finetune else args.max_epochs,
+        patience=args.finetune_patience if args.finetune else 5,
+        learning_rate=args.finetune_lr if args.finetune else 0.01,
+        step_size=15 if args.finetune else 10,
         minimum_bit_errors=args.min_bit_errors,
         maximum_frames=args.max_frames,
         evaluation_batch_frames=args.batch_frames,
+        shaping_calibration_samples=args.shaping_calibration_samples,
     )
     validate_codebook()
     bch_description = validate_bch()
+    if args.classical_distance_only:
+        run_classical_distance_experiment(args, config, output_dir)
+        return
     if trainable_parameter_count(DeepFFNN()) != 16_288:
         raise AssertionError("FFNN parameter-count validation failed")
 
@@ -944,15 +1436,23 @@ def run(args: argparse.Namespace) -> None:
         config,
         model_path,
         retrain=args.retrain,
+        finetune=args.finetune,
     )
     training_rows: list[dict[str, Any]] = [training_summary]
+
+    if args.p1_sweep_only:
+        run_p1_sweep(args, model, config, output_dir, model_path)
+        return
+    if args.joint_bch15_only:
+        run_joint_bch15_experiment(args, model, config, output_dir, model_path)
+        return
 
     for sigma_percent in args.sigmas:
         # Evaluation remains no-offset at each requested sigma.
         channel = channel_for_sigma(config, sigma_percent)
 
         without_coding = exact_without_coding(channel)
-        only_bch = exact_only_bch(channel)
+        only_bch = simulate_only_bch(channel, config, sigma_percent)
         slnn, only_sparse_ml = simulate_slnn_and_only_sparse_ml(
             model,
             channel,
@@ -1038,16 +1538,16 @@ def run(args: argparse.Namespace) -> None:
         "method_definitions": {
             "SLNN [1]": "sparse 7/9 encoder + Deep FFNN decoder; no BCH; no alpha",
             "without coding": "7 raw bits + threshold detector; exact analytical BER/FER",
-            "BCH+sparse": "full 7-bit BCH(15,7,t=2) + pad6 + 3 sparse blocks + FFNN + standard nearest-BCH decoder",
-            "only-BCH": "BCH(15,7,t=2) + threshold + nearest BCH; exact exhaustive hard-output enumeration",
+            "BCH+sparse": "BCH(31,16,t=3) + 4 calibrated shaping bits + 5 sparse blocks + FFNN + syndrome decoder",
+            "only-BCH": "BCH(31,16,t=3) + threshold + syndrome decoder; Monte Carlo",
             "only-sparse (ML decoding)": "paper baseline sparse 7/9 + alpha=2.5 Euclidean decoder",
         },
-        "payload_bits_per_frame": 7,
+        "payload_bits_per_frame": {"BCH+sparse": 16, "only-BCH": 16, "other_methods": 7},
         "physical_bits_per_frame": {
             "SLNN [1]": 9,
             "without coding": 7,
-            "BCH+sparse": 27,
-            "only-BCH": 15,
+            "BCH+sparse": 45,
+            "only-BCH": 31,
             "only-sparse (ML decoding)": 9,
         },
         "ffnn_training_strategy": (
@@ -1083,6 +1583,48 @@ def parse_args() -> argparse.Namespace:
         help="sigma_mu percentages; default: 10 11 12 13 14 15",
     )
     parser.add_argument(
+        "--p1-sweep-only",
+        action="store_true",
+        help=(
+            "Generate all_curves_p1_sigma10.csv from the five existing curves "
+            "without rerunning the sigma sweep."
+        ),
+    )
+    parser.add_argument(
+        "--joint-bch15-only",
+        action="store_true",
+        help=(
+            "Compare BCH(15,7)+6 zero padding+3 sparse blocks using cascaded "
+            "FFNN/hard/BCH and exact joint ML over all 27 resistances."
+        ),
+    )
+    parser.add_argument(
+        "--classical-distance-only",
+        action="store_true",
+        help=(
+            "Compare pure Euclidean and pooled-covariance Mahalanobis sparse "
+            "decoders on identical samples; neither decoder uses AI."
+        ),
+    )
+    parser.add_argument(
+        "--p1-values",
+        type=float,
+        nargs="+",
+        default=list(P1_SWEEP),
+        help="P1 values for --p1-sweep-only.",
+    )
+    parser.add_argument(
+        "--p1-sigma",
+        type=int,
+        default=10,
+        help="Fixed sigma_mu percentage for --p1-sweep-only; default: 10.",
+    )
+    parser.add_argument(
+        "--skip-only-bch",
+        action="store_true",
+        help="Skip the only-BCH curve in a P1 sweep to reduce runtime.",
+    )
+    parser.add_argument(
         "--train-sigmas",
         type=float,
         nargs="+",
@@ -1097,6 +1639,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-bit-errors", type=int, default=500)
     parser.add_argument("--max-frames", type=int, default=5_000_000)
     parser.add_argument(
+        "--shaping-calibration-samples",
+        type=int,
+        default=2_000,
+        help="Noisy FFNN samples per sparse class used to choose shaping bits.",
+    )
+    parser.add_argument(
         "--model-dir",
         default=str(project_dir / "models"),
         help="Directory containing/receiving the single global FFNN checkpoint.",
@@ -1110,17 +1658,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore an existing checkpoint and retrain the single global FFNN.",
     )
+    parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Continue from the existing checkpoint using the harder fine-tune schedule.",
+    )
+    parser.add_argument("--finetune-nr-train", type=int, default=1_800_000)
+    parser.add_argument("--finetune-epochs", type=int, default=60)
+    parser.add_argument("--finetune-patience", type=int, default=10)
+    parser.add_argument("--finetune-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--finetune-train-sigmas",
+        type=float,
+        nargs="+",
+        default=[0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18],
+        help="Harder sigma mixture used only with --finetune.",
+    )
     parsed = parser.parse_args()
+    if parsed.retrain and parsed.finetune:
+        parser.error("--retrain and --finetune are mutually exclusive")
+    exclusive_modes = sum(
+        [
+            parsed.p1_sweep_only,
+            parsed.joint_bch15_only,
+            parsed.classical_distance_only,
+        ]
+    )
+    if exclusive_modes > 1:
+        parser.error(
+            "--p1-sweep-only, --joint-bch15-only, and "
+            "--classical-distance-only are mutually exclusive"
+        )
     invalid = [sigma for sigma in parsed.sigmas if not (1 <= sigma <= 100)]
     if invalid:
         parser.error(f"Invalid sigma percentages: {invalid}")
+    if not (1 <= parsed.p1_sigma <= 100):
+        parser.error("p1-sigma must be a percentage from 1 to 100")
+    invalid_p1 = [p1 for p1 in parsed.p1_values if not (0.0 <= p1 <= 1.0)]
+    if invalid_p1:
+        parser.error(f"Invalid P1 probabilities: {invalid_p1}")
     invalid_train = [sigma for sigma in parsed.train_sigmas if not (0.0 < sigma < 1.0)]
     if invalid_train:
         parser.error(f"Invalid training sigma ratios: {invalid_train}")
     if parsed.nr_train <= 0 or parsed.training_chunk_size <= 0:
         parser.error("nr-train and training-chunk-size must be positive")
+    if parsed.shaping_calibration_samples <= 0:
+        parser.error("shaping-calibration-samples must be positive")
     if parsed.nr_train % len(parsed.train_sigmas) != 0:
         parser.error("nr-train must be divisible by the number of train-sigmas")
+    invalid_finetune = [
+        sigma for sigma in parsed.finetune_train_sigmas if not (0.0 < sigma < 1.0)
+    ]
+    if invalid_finetune:
+        parser.error(f"Invalid fine-tune sigma ratios: {invalid_finetune}")
+    if parsed.finetune_nr_train <= 0 or parsed.finetune_epochs <= 0:
+        parser.error("fine-tune sample and epoch counts must be positive")
+    if parsed.finetune_patience <= 0 or parsed.finetune_lr <= 0.0:
+        parser.error("fine-tune patience and learning rate must be positive")
+    if parsed.finetune_nr_train % len(parsed.finetune_train_sigmas) != 0:
+        parser.error(
+            "finetune-nr-train must be divisible by the number of fine-tune sigmas"
+        )
     return parsed
 
 
