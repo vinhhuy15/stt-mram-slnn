@@ -1,0 +1,70 @@
+{
+  "description": "Controlled BCH(15,7)+6 zero padding+3 sparse blocks experiment: cascaded FFNN/hard/BCH versus exact joint ML over 27 resistances",
+  "created_by_script": "D:\\downloads\\sttmram_global_ffnn_training\\run_all_curves.py",
+  "script_sha256": "4cca8ebc597dfb129f1ea621fe7f0043e56b02e4243927a1097f9a521cb25d0e",
+  "config": {
+    "p1": 0.0002,
+    "p0_over_p1": 0.01,
+    "pr_over_p1": 0.01,
+    "read_direction": "write0",
+    "mu0": 1.0,
+    "mu1": 2.0,
+    "offset_mean": 0.0,
+    "offset_sigma_over_mu1": 0.0,
+    "alpha": 2.5,
+    "train_sigmas": [
+      0.08,
+      0.09,
+      0.1,
+      0.11,
+      0.12,
+      0.13,
+      0.14,
+      0.15
+    ],
+    "nr_train": 1500000,
+    "training_chunk_size": 10000,
+    "train_fraction": 0.9,
+    "train_batch_size": 256,
+    "max_epochs": 30,
+    "patience": 5,
+    "min_delta": 0.0001,
+    "learning_rate": 0.01,
+    "step_size": 10,
+    "lr_gamma": 0.5,
+    "weight_decay": 0.0,
+    "evaluation_batch_frames": 5000,
+    "minimum_bit_errors": 500,
+    "maximum_frames": 5000000,
+    "shaping_calibration_samples": 2000,
+    "seed": 42
+  },
+  "sigmas_percent": [
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "bch_sparse": {
+    "n": 15,
+    "k": 7,
+    "d_min": 5,
+    "t": 2,
+    "padding_bits": 6,
+    "sparse_blocks": 3,
+    "resistance_observations": 27,
+    "joint_candidates": 128
+  },
+  "hypothesis": "Joint 27-cell ML reduces payload BER/FER.",
+  "controlled_comparison": "Both decoders consume identical transmitted messages and resistance samples.",
+  "baseline": "global FFNN per 9-cell block -> hard 21 bits -> BCH(15,7)",
+  "proposed": "argmax over 128 exact channel likelihoods using all 27 cells",
+  "checkpoint_file": {
+    "path": "D:\\downloads\\sttmram_global_ffnn_training\\models\\deep_ffnn_model.pt",
+    "sha256": "c33e3ee639c5f6e838341c5461b41e2c1f200f8e77db89d84cb8976645216776"
+  },
+  "output_file": "D:\\downloads\\sttmram_global_ffnn_training\\results\\joint_bch15_sparse27.csv",
+  "elapsed_seconds": 483.56988620758057
+}
