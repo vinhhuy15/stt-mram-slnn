@@ -1,89 +1,98 @@
-# STT-MRAM: hướng dẫn chạy nhanh
+# STT-MRAM: Quick Run Guide
 
-## Chuẩn bị
+## Prerequisites
 
-Chạy trong thư mục dự án bằng môi trường ảo:
+Run the following commands from the project directory using the virtual environment:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --help
 ```
 
-Nếu chưa cài thư viện:
+If the required dependencies have not been installed yet:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 1. Quét theo `sigma_mu`
+## 1. Sweep by `sigma_mu`
 
-Mặc định cố định `P1 = 2e-4`, quét `sigma_mu = 10..15` và chạy đủ 5 đường:
+By default, `P1 = 2e-4` is fixed, while `sigma_mu` is swept from `10` to `15`, generating all five curves:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py
 ```
 
-Chọn các sigma riêng:
+To run only selected sigma values:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --sigmas 9 10 11
 ```
 
-Kết quả chính: `results/all_curves_sigma10_15.csv`.
+Main output:
 
-## 2. Quét theo `P1`
+```text
+results/all_curves_sigma10_15.csv
+```
 
-Cố định `sigma_mu = 10%`:
+## 2. Sweep by `P1`
+
+Fix `sigma_mu = 10%`:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10
 ```
 
-Chạy nhanh hơn bằng cách bỏ đường `only-BCH`:
+To speed up the simulation by skipping the `only-BCH` curve:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10 --skip-only-bch
 ```
 
-Ví dụ chạy gần điều kiện Figure 6 với `sigma_mu = 9%`:
+For conditions close to those used in Figure 6 with `sigma_mu = 9%`:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 9 --skip-only-bch
 ```
 
-Chọn các mốc `P1` riêng:
+To specify custom `P1` values:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10 --p1-values 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 --skip-only-bch
 ```
 
-Kết quả được đặt tên theo sigma, ví dụ:
+Output files are named according to the selected sigma value. For example:
 
-- `results/all_curves_p1_sigma9.csv`
-- `results/all_curves_p1_sigma10.csv`
-- `results/run_manifest_p1_sigma9.json`
-- `results/run_manifest_p1_sigma10.json`
+* `results/all_curves_p1_sigma9.csv`
+* `results/all_curves_p1_sigma10.csv`
+* `results/run_manifest_p1_sigma9.json`
+* `results/run_manifest_p1_sigma10.json`
 
-CSV P1 sweep chứa cả BER và FER cho từng đường được chạy.
+The P1-sweep CSV files contain both BER and FER for each simulated curve.
 
-## 3. Checkpoint FFNN
+## 3. FFNN Checkpoint
 
-Mặc định chương trình tải checkpoint hiện có tại
-`models/deep_ffnn_model.pt`.
+By default, the program loads the existing checkpoint:
 
-Huấn luyện lại từ đầu:
+```text
+models/deep_ffnn_model.pt
+```
+
+To retrain the model from scratch:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --retrain
 ```
 
-Fine-tune checkpoint hiện tại:
+To fine-tune the existing checkpoint:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --finetune
 ```
 
-`--retrain` và `--finetune` không được dùng cùng lúc.
+`--retrain` and `--finetune` cannot be used at the same time.
 
-.
-- `--skip-only-bch` hiện chỉ áp dụng cho P1 sweep.
-- Các mô phỏng dùng seed cố định `42` và ghi CSV tăng dần sau mỗi điểm.
+## Notes
+
+* `--skip-only-bch` currently applies only to the P1 sweep.
+* All simulations use a fixed random seed of `42`.
+* Results are appended to the CSV file incrementally after each simulation point.
