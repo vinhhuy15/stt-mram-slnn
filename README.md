@@ -1,40 +1,42 @@
-# STT-MRAM: Quick Run Guide
+# SLNN-Assisted Decoding for STT-MRAM
 
-## Prerequisites
+This project explores neural-network-assisted decoding of a **7/9-rate sparse code** for STT-MRAM. I used **Python and PyTorch** to simulate channel errors, train a feed-forward neural network, and compare decoding performance using **BER** and **FER**.
 
-Run the following commands from the project directory using the virtual environment:
+## Paper
 
-```powershell
-.\.venv\Scripts\python.exe run_all_curves.py --help
-```
+**“SLNN-Assisted Decoding of a 7/9-Rate Sparse Code for Reliable STT-MRAM”**
 
-If the required dependencies have not been installed yet:
+Accepted at **ICEBA 2026** and for publication in **Springer's Lecture Notes in Electrical Engineering (LNEE)**.
+
+*Paper link will be added when available.*
+
+## Quick Start
+
+Run these commands from the project folder using Windows PowerShell.
+
+**Install dependencies:**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 1. Sweep by `sigma_mu`
+### 1. Sweep `sigma_mu`
 
-By default, `P1 = 2e-4` is fixed, while `sigma_mu` is swept from `10` to `15`, generating all five curves:
+By default, `P1 = 2e-4` is fixed and `sigma_mu` is swept from `10` to `15` to generate five curves.
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py
 ```
 
-To run only selected sigma values:
+For specific values:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --sigmas 9 10 11
 ```
 
-Main output:
+Default output: `results/all_curves_sigma10_15.csv`
 
-```text
-results/all_curves_sigma10_15.csv
-```
-
-## 2. Sweep by `P1`
+### 2. Sweep `P1`
 
 Fix `sigma_mu = 10%`:
 
@@ -42,57 +44,35 @@ Fix `sigma_mu = 10%`:
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10
 ```
 
-To speed up the simulation by skipping the `only-BCH` curve:
-
-```powershell
-.\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10 --skip-only-bch
-```
-
-For conditions close to those used in Figure 6 with `sigma_mu = 9%`:
+For settings close to **Figure 6** in the paper (`sigma_mu = 9%`):
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 9 --skip-only-bch
 ```
 
-To specify custom `P1` values:
+Results are saved in `results/` as CSV and JSON files, including BER and FER measurements.
 
-```powershell
-.\.venv\Scripts\python.exe run_all_curves.py --p1-sweep-only --p1-sigma 10 --p1-values 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 --skip-only-bch
-```
+## Model Checkpoint
 
-Output files are named according to the selected sigma value. For example:
+The script uses the saved model at `models/deep_ffnn_model.pt` by default.
 
-* `results/all_curves_p1_sigma9.csv`
-* `results/all_curves_p1_sigma10.csv`
-* `results/run_manifest_p1_sigma9.json`
-* `results/run_manifest_p1_sigma10.json`
-
-The P1-sweep CSV files contain both BER and FER for each simulated curve.
-
-## 3. FFNN Checkpoint
-
-By default, the program loads the existing checkpoint:
-
-```text
-models/deep_ffnn_model.pt
-```
-
-To retrain the model from scratch:
+To train from scratch:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --retrain
 ```
 
-To fine-tune the existing checkpoint:
+To fine-tune the existing model:
 
 ```powershell
 .\.venv\Scripts\python.exe run_all_curves.py --finetune
 ```
 
-`--retrain` and `--finetune` cannot be used at the same time.
+These two options cannot be used together.
 
 ## Notes
 
-* `--skip-only-bch` currently applies only to the P1 sweep.
-* All simulations use a fixed random seed of `42`.
-* Results are appended to the CSV file incrementally after each simulation point.
+- Random seed: `42`.
+- Results are saved incrementally during simulations.
+- `--skip-only-bch` only works for the `P1` sweep.
+- Run `.\.venv\Scripts\python.exe run_all_curves.py --help` for more options.
