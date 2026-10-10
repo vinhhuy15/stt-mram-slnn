@@ -76,18 +76,18 @@ import torch
 from scipy.spatial import cKDTree
 from torch import nn
 
-from paper79.channel import (
+from code.channel import (
     ChannelConfig,
     conditional_detector_error_probabilities,
     sample_resistance,
 )
-from paper79.codebook import CODEBOOK, MESSAGE_BITS, validate_codebook
-from paper79.distance_decoders import (
+from code.codebook import CODEBOOK, MESSAGE_BITS, validate_codebook
+from code.distance_decoders import (
     euclidean_decode_indices,
     mahalanobis_decode_indices,
     pooled_within_class_covariance,
 )
-from paper79.joint_bch_sparse import (
+from code.joint_bch_sparse import (
     BCH15_PHYSICAL_CODEBOOK,
     encode_bch15_sparse,
     joint_ml_decode_indices,
